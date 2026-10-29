@@ -48,12 +48,13 @@ def draw_tree(path: str = f"{RUNS}/hierarchy_tree.png") -> str:
     y = 0.0
     for c in range(NUM_COARSE):
         children = COARSE_TO_FINE[c]
-        y_top = y
-        for j, f in enumerate(children):
-            ax.plot([1, 2], [y_top + (j - 2) * 0.18, y], color=colors[c], lw=1.2)
+        # The parent node sits at the vertical midpoint of its children, and
+        # every edge fans out from that point.
+        cy = y - (len(children) - 1) * 0.5
+        for f in children:
+            ax.plot([1, 2], [cy, y], color=colors[c], lw=1.2)
             ax.text(2.05, y, FINE_NAMES[f], va="center", fontsize=7)
             y -= 1.0
-        cy = y_top - (len(children) - 1) * 0.5
         ax.scatter([1], [cy], s=60, color=colors[c], zorder=3)
         ax.text(0.95, cy, COARSE_NAMES[c], va="center", ha="right", fontsize=8, weight="bold")
     ax.set_xlim(-0.2, 3.2)
@@ -139,8 +140,8 @@ def plot_curves(history: dict[str, list[float]], title: str, path: str) -> str:
 
 def plot_violation_comparison(series: dict[str, list[float]],
                               path: str = f"{RUNS}/violation_comparison.png") -> str:
-    """The Stage-4 money shot: violation-rate curves for {no-dloss, their-dloss,
-    soft-consistency} on one axis."""
+    """The Stage-4 money shot: violation-rate curves for {lloss only, their dloss,
+    soft loss, head agreement} on one axis."""
     return plot_curves(series, "Hierarchy-violation rate by loss (lower = respects the tree)", path)
 
 
@@ -156,36 +157,42 @@ class EmbeddingEvolution:
     """
 
     def __init__(self, max_points: int = 2000):
-        self.snaps: list[tuple[int, np.ndarray, np.ndarray]] = []
+        self._raw: list[tuple[int, np.ndarray, np.ndarray]] = []
         self.max_points = max_points
-        self._pca: PCA | None = None
 
     def record(self, epoch: int, feats: np.ndarray, coarse: np.ndarray) -> None:
-        """Project this epoch's 256-D features to 2-D and stash them.
-
-        PCA centres the data and takes the top two eigenvectors of its covariance
-        matrix -- the two orthogonal directions of greatest variance -- then
-        projects onto them. It is the best possible 2-D *linear* summary in the
-        least-squares sense (Eckart-Young), which is what we want here: we are
-        asking whether the superclasses have become linearly separated, so a
-        nonlinear embedding like t-SNE or UMAP would beg the question by
-        manufacturing clusters even from noise.
-
-        The subtle part is `fit` ONCE, on the first snapshot, then only
-        `transform` afterwards. Re-fitting every epoch would choose new axes each
-        time, so the cloud would spin between frames and we could not tell real
-        movement from a rotating coordinate system. Fixing the basis at epoch 0
-        means everything you see move in the GIF is the representation actually
-        moving.
-        """
+        """Stash this epoch's 256-D features; projection happens once, at the end."""
         if feats.shape[0] > self.max_points:
             # Seeded generator so the same points are tracked in every frame; a
             # fresh random subset per epoch would make points flicker in and out.
             idx = np.random.default_rng(0).choice(feats.shape[0], self.max_points, replace=False)
             feats, coarse = feats[idx], coarse[idx]
-        if self._pca is None:
-            self._pca = PCA(n_components=2).fit(feats)
-        self.snaps.append((epoch, self._pca.transform(feats), coarse))
+        self._raw.append((epoch, feats, coarse))
+
+    @property
+    def snaps(self) -> list[tuple[int, np.ndarray, np.ndarray]]:
+        """Every snapshot projected to 2-D in ONE shared PCA basis.
+
+        PCA centres the data and takes the top two eigenvectors of its covariance
+        matrix -- the two orthogonal directions of greatest variance -- then
+        projects onto them. It is the best possible 2-D *linear* summary in the
+        least-squares sense (Eckart-Young). We prefer it to t-SNE or UMAP because
+        it is a fixed linear map: any clustering you see was already in the
+        features, not manufactured by a nonlinear embedding that can carve
+        clusters out of noise.
+
+        Two choices matter. First, one basis for every frame: re-fitting per epoch
+        would choose new axes each time, so the cloud would spin between frames and
+        we could not tell real movement from a rotating coordinate system. Second,
+        the basis is fitted on the FINAL snapshot, not the first. At random init
+        the directions of greatest variance are arbitrary; the superclass structure
+        the network later learns can lie almost entirely outside them, and the GIF
+        would show the trained clusters collapsed on top of each other. Fitting on
+        the trained features picks the axes where that structure lives, then plays
+        the earlier epochs back in those same axes.
+        """
+        pca = PCA(n_components=2).fit(self._raw[-1][1])
+        return [(ep, pca.transform(f), c) for ep, f, c in self._raw]
 
     def _centroids(self, emb: np.ndarray, coarse: np.ndarray) -> np.ndarray:
         cs = np.full((NUM_COARSE, 2), np.nan)
@@ -198,14 +205,15 @@ class EmbeddingEvolution:
     def save_gif(self, path: str = f"{RUNS}/embedding_evolution.gif", fps: int = 2) -> str:
         _ensure_runs()
         colors = coarse_colors()
-        all_xy = np.concatenate([e for _, e, _ in self.snaps])
+        snaps = self.snaps
+        all_xy = np.concatenate([e for _, e, _ in snaps])
         xlim = (all_xy[:, 0].min(), all_xy[:, 0].max())
         ylim = (all_xy[:, 1].min(), all_xy[:, 1].max())
         fig, ax = plt.subplots(figsize=(7, 7))
 
         def frame(i: int):
             ax.clear()
-            ep, emb, coarse = self.snaps[i]
+            ep, emb, coarse = snaps[i]
             ax.scatter(emb[:, 0], emb[:, 1], c=colors[coarse], s=6, alpha=0.6, linewidths=0)
             ax.set_xlim(*xlim)
             ax.set_ylim(*ylim)
@@ -213,7 +221,7 @@ class EmbeddingEvolution:
             ax.set_xticks([])
             ax.set_yticks([])
 
-        anim = FuncAnimation(fig, frame, frames=len(self.snaps), interval=1000 // fps)
+        anim = FuncAnimation(fig, frame, frames=len(snaps), interval=1000 // fps)
         anim.save(path, writer=PillowWriter(fps=fps))
         plt.close(fig)
         return path

@@ -1,13 +1,16 @@
 """The hierarchy losses — where the taxonomy meets the optimizer.
 
-Three objects live here:
+Four objects live here:
 
   1. layer_loss        their `lloss`: per-level cross-entropy. Healthy.
   2. faithful_dloss    their `dloss`, ported faithfully. Kept ONLY as evidence:
                        it is piecewise-constant and therefore carries no gradient.
-  3. SoftHierarchyLoss the differentiable replacement, built on the observation
-                       that "does the child respect its parent?" is a
-                       MARGINALIZATION — a linear map — not a comparison.
+  3. SoftHierarchyLoss a first differentiable replacement, built on the
+                       observation that "does the child respect its parent?" is
+                       a MARGINALIZATION — a linear map — not a comparison.
+                       Correct, but it did not reduce head disagreement.
+  4. HeadAgreementLoss the replacement that did: the same marginalization, but
+                       compared against the coarse head instead of the label.
 """
 
 from __future__ import annotations
@@ -123,6 +126,16 @@ class SoftHierarchyLoss(nn.Module):
     We select the children with masked_fill(-inf) rather than multiplying by M:
     exp(-inf) = 0 contributes nothing to the sum, whereas multiplying probabilities
     by a 0/1 mask would put a hard zero *inside* a log.
+
+    A caveat the experiments bear out. The true fine class is one of the children
+    of the true parent, so its probability is part of the summed mass:
+
+        p(fine_true)  <=  mass(parent_true)   =>   -log mass  <=  CE(fine)
+
+    This loss is therefore a strictly weaker version of the fine cross-entropy
+    that layer_loss already contains: whenever the fine head is right, this term
+    is already small. It adds little new pressure, and none at all on the coarse
+    head -- see HeadAgreementLoss for what that implies.
     """
 
     def __init__(self, beta: float = 1.0):
@@ -165,11 +178,21 @@ class HeadAgreementLoss(nn.Module):
         L = KL(m || c) = sum_p m_p * (log m_p - log c_p)
 
     KL is not symmetric, and the direction is a modelling choice. KL(m || c)
-    weights each term by m, so it punishes hardest where the FINE head is
-    confident and the coarse head disagrees -- it pulls the coarse head toward
-    the fine head's (100-way, more specific) evidence. The reverse direction would
-    do the opposite. Gradient flows into both heads, so they meet rather than one
-    chasing the other.
+    weights each term by m, so it is largest where the FINE head puts mass on a
+    parent the coarse head considers unlikely. Gradient flows into both heads,
+    but they feel it differently:
+
+      * coarse head: d/d(coarse logits) = c - m, the same gradient as
+        cross-entropy with m as a soft target. The coarse head is pulled toward
+        the fine head's (100-way, more specific) opinion.
+      * fine head: as a function of m, KL(m || c) is mode-seeking -- it is cheap
+        to drop mass from a parent but expensive to put mass where c is near 0.
+        The fine head is pushed to keep its mass inside parents the coarse head
+        already believes in.
+
+    So the heads meet rather than one chasing the other. Agreeing on a wrong
+    answer would satisfy this term, which is why it is only ever added to
+    layer_loss, never used alone.
 
     Everything is computed from log-probabilities for the same reason as above:
     m_p is a sum over children, which is a logsumexp in log-space, and KL needs
@@ -223,7 +246,8 @@ def flat_violation_rate(fine_logits, coarse_true) -> float:
 
     Stage 1 has only one head, so there is no second opinion to contradict; we ask
     instead whether the predicted fine class at least lands in the correct
-    superclass. Note this is a strictly harder bar than violation_rate above --
-    it is 100 - (coarse accuracy) -- so the two numbers are not interchangeable.
+    superclass. That makes it exactly 100 - (implied coarse accuracy): it measures
+    correctness against the truth, whereas violation_rate measures agreement
+    between two heads. Different questions, so the numbers are not comparable.
     """
     return (coarse_of(fine_logits.argmax(1)) != coarse_true).float().mean().item() * 100.0

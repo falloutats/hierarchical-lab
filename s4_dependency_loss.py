@@ -83,13 +83,14 @@ def grad_probe(device) -> None:
     s = soft(f_logits, coarse)
     model.zero_grad()
     s.backward()
+    # Global L2 norm over every backbone parameter: sqrt of the summed squares.
     trunk_grad = sum(
-        p.grad.norm().item()
+        p.grad.pow(2).sum().item()
         for n, p in model.named_parameters()
         if n.startswith("backbone") and p.grad is not None
-    )
+    ) ** 0.5
     print(f"soft loss  requires_grad : {s.requires_grad}   grad_fn: {type(s.grad_fn).__name__}")
-    print(f"soft loss  trunk grad-norm: {trunk_grad:.4f}   -> gradient reaches the backbone. ")
+    print(f"soft loss  trunk grad-norm: {trunk_grad:.4f}   -> gradient reaches the backbone.")
 
 
 def train_variant(name, use_dloss, use_soft, use_agree, args, device):

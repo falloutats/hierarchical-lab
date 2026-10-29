@@ -3,7 +3,7 @@ CIFAR-100. Test it on a tiny hand-built tree where we can check every number."""
 
 import torch
 
-from structured_loss import SoftHierarchyLoss, build_parent_matrix
+from structured_loss import HeadAgreementLoss, SoftHierarchyLoss, build_parent_matrix
 
 # 4 children under 2 parents: children 0,1 -> parent 0 ; children 2,3 -> parent 1.
 CHILD_TO_PARENT = [0, 0, 1, 1]
@@ -42,3 +42,12 @@ def test_violation_rate():
     # Compared against parents [0, 0]: first consistent, second violates.
     assert loss_fn.violation_rate(logits, torch.tensor([0, 0])) == 50.0
     assert loss_fn.violation_rate(logits, torch.tensor([0, 1])) == 0.0
+
+
+def test_head_agreement_zero_when_heads_agree_positive_when_not():
+    loss_fn = HeadAgreementLoss(CHILD_TO_PARENT)
+    fine = torch.tensor([[10.0, -10.0, -10.0, -10.0]])        # mass in parent 0
+    agree = loss_fn(torch.tensor([[10.0, -10.0]]), fine)
+    clash = loss_fn(torch.tensor([[-10.0, 10.0]]), fine)
+    assert agree.item() < 1e-3
+    assert clash.item() > 5.0
