@@ -3,7 +3,8 @@
 Everything in the pathway that's worth keeping, distilled into one file with no
 CIFAR/torchvision dependency. Point it at ANY two-level taxonomy: pass a
 `child_to_parent` list (child_to_parent[fine_id] = coarse_id) and you get a
-differentiable "respect the tree" loss and a violation metric.
+differentiable "respect the tree" loss, a head-agreement loss for two-head
+models, and a violation metric.
 
 Where this applies in your future work
 ---------------------------------------
@@ -12,9 +13,10 @@ Any time you know structure among your outputs and want the model to honor it:
   * Cascaded / coarse-to-fine decoders (predict the region, then the point).
   * Product / document categorization, ICD codes, any ontology.
 The pattern: (1) share a trunk, (2) supervise every level, (3) enforce
-consistency by MARGINALIZING the fine distribution up to the parent and making
-that agree with the coarse target — differentiably. Never enforce it with
-argmax; argmax has no gradient (see faithful_dloss in losses.py for the trap).
+consistency by MARGINALIZING the fine distribution up to the parents and making
+that agree with the coarse head's own distribution (HeadAgreementLoss) —
+differentiably. Never enforce it with argmax; argmax has no gradient (see
+faithful_dloss in losses.py for the trap).
 """
 
 from __future__ import annotations
@@ -95,3 +97,34 @@ class SoftHierarchyLoss(nn.Module):
         """
         implied_parent = self.child_to_parent[fine_logits.argmax(1)]
         return (implied_parent != parent_pred_or_target).float().mean().item() * 100.0
+
+
+class HeadAgreementLoss(nn.Module):
+    """KL( fine head marginalized to parents || coarse head ), for two-head models.
+
+    SoftHierarchyLoss ties the fine head to the TRUE parent. If what you care about
+    is the two heads not contradicting each other, that is the wrong target: put
+    the agreement itself in the objective. With m the fine distribution summed
+    within each parent and c the coarse head's distribution,
+
+        loss = KL(m || c) = sum_p m_p * (log m_p - log c_p)
+
+    Both heads get gradient: the coarse head is fit to m as a soft target, and the
+    fine head is pushed to keep its mass inside parents the coarse head believes
+    in. Two heads can agree on a wrong answer, so add this to per-level
+    cross-entropy; never use it alone. The group-sum is a logsumexp over masked
+    log-probabilities, for the same underflow reasons as SoftHierarchyLoss.
+    """
+
+    def __init__(self, child_to_parent: list[int], gamma: float = 1.0):
+        super().__init__()
+        self.gamma = gamma
+        self.register_buffer("M", build_parent_matrix(child_to_parent))
+
+    def forward(self, coarse_logits: torch.Tensor, fine_logits: torch.Tensor) -> torch.Tensor:
+        log_p = F.log_softmax(fine_logits, dim=1)                          # (B, C)
+        # (B, 1, C) against the (1, P, C) mask -> per-parent log-mass, (B, P).
+        masked = log_p.unsqueeze(1).masked_fill(self.M.unsqueeze(0) == 0, float("-inf"))
+        log_m = torch.logsumexp(masked, dim=2)
+        log_c = F.log_softmax(coarse_logits, dim=1)
+        return self.gamma * (log_m.exp() * (log_m - log_c)).sum(dim=1).mean()

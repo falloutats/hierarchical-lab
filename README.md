@@ -1,170 +1,150 @@
 # hierarchical-lab
 
-A hands-on pathway for one idea worth internalizing:
+> **When you know the structure among your outputs, build it into the architecture *and* the objective.**
 
-> **When you know structure among your outputs, bake it into the architecture *and* the objective.**
+CIFAR-100's 100 fine classes nest under 20 superclasses, which gives you a real taxonomy to exploit. This repo
+is a staged walkthrough. Each script changes one thing, measures it against the previous stage, and runs in
+seconds per epoch on Apple-Silicon MPS.
 
-CIFAR-100's 100 fine classes nest under 20 coarse superclasses — a real taxonomy to exploit.
+**Built on [Ugenteraan/Deep_Hierarchical_Classification](https://github.com/Ugenteraan/Deep_Hierarchical_Classification)**
+by Ugenteraan Manogaran (MIT, © 2021), an unofficial implementation of
+[Wan et al. 2020, *Deep Hierarchical Classification for Category Prediction in E-commerce*](https://arxiv.org/abs/2005.06692).
+The coarse-to-fine head and the hierarchical losses here follow that repo. The critique below is a good-faith
+technical note about one implementation detail. See [`NOTICE`](NOTICE).
 
-> ## 🙏 Credits — this is a learning project built on someone else's work
->
-> This repo exists because of **[Ugenteraan/Deep_Hierarchical_Classification](https://github.com/Ugenteraan/Deep_Hierarchical_Classification)**
-> by **[Ugenteraan Manogaran](https://github.com/Ugenteraan)** (MIT, © 2021). I read that repo closely and
-> built this as a study pathway around its ideas — the **coarse-to-fine classifier head** and the
-> **hierarchical loss formulation** here follow its approach directly. Please go star the original.
->
-> That project is an unofficial implementation of **"Deep Hierarchical Classification for Category
-> Prediction in E-commerce System"**, Wan et al. 2020 — [arXiv:2005.06692](https://arxiv.org/abs/2005.06692).
->
-> Where this repo critiques the original (see *"The bug that's the best lesson"* below), it's offered in
-> good faith as a technical observation about one implementation detail — not as a knock on a project that
-> was generous enough to be public and readable in the first place. Being able to read real code and learn
-> from it is the whole point. See [`NOTICE`](NOTICE) for full attribution details.
+## TL;DR
 
-Runs on Apple-Silicon **MPS** in seconds/epoch with a small CNN, so you can iterate and *watch* what changes.
+| finding | evidence |
+|---|---|
+| The upstream dependency loss has **no gradient**. It is built from `argmax`/`==`/`where`. | `requires_grad=False`. Training with and without it is bit-for-bit identical. |
+| A correct, differentiable replacement (`SoftHierarchyLoss`) **did not help**. | Violation rate went from 26.39% to 28.07%. |
+| Putting the measured quantity in the loss (`HeadAgreementLoss`) **did help**. | Violation rate went from 26.39% to 20.52%, with fine accuracy within 0.4 pts. |
+| Coarse-to-fine conditioning did **not** beat plain two-head training at this scale. | Fine accuracy 48.16% vs 50.79%. |
 
-## The two ideas we keep
+## The ideas
 
-1. **Coarse-to-fine conditioning (architecture).** One shared backbone → a coarse head (20 logits) whose output
-   is *concatenated into* the fine head (`cat(20, 100) → 100`). The fine decision is conditioned on the coarse
-   one. See `models.py: CoarseToFineModel` — faithful to the repo's `model/resnet50.py`.
+**1. Coarse-to-fine conditioning (architecture).** A shared backbone feeds a coarse head (20 logits). Those
+logits are concatenated into the fine head: `cat(20, 100) → 100`. This is `models.CoarseToFineModel`, faithful to
+the upstream `model/resnet50.py`. One caveat: the coarse logits are themselves linear in the features, so this
+coupling reparameterizes the fine head without making it more expressive. See the model's docstring.
 
-2. **Put the taxonomy in the loss.**
-   - **Layer loss** (`lloss`): cross-entropy at every level, summed. Deep supervision. `losses.layer_loss`.
-   - **Dependency loss**: penalize a fine prediction that isn't a child of the predicted coarse class.
+**2. Taxonomy in the loss.**
 
-## The bug that's the best lesson
+- **Layer loss** (`lloss`) is cross-entropy at every level, summed. `losses.layer_loss`
+- **Dependency loss** penalizes a fine prediction that isn't a child of the predicted superclass.
 
-The repo's dependency loss is:
+## The dead loss
 
-```
-D_l    = 1 if argmax(fine) is NOT a child of argmax(coarse) else 0
-l_prev = 0 if argmax(coarse)==coarse_true else 1
-l_curr = 0 if argmax(fine)  ==fine_true   else 1
-dloss  = Σ  p^(D_l·l_prev) · p^(D_l·l_curr) − 1        # p = 3
-```
-
-Every term comes from `argmax` / `==` / `where` — all **non-differentiable**. So `dloss.requires_grad` is
-`False`; it can't even `.backward()`. Their headline "respect the hierarchy" mechanism contributes **zero
-gradient** — it's a monitoring number dressed as a loss. Stage 4 proves this, then replaces it with a
-differentiable version:
+The upstream dependency loss:
 
 ```
-SoftHierarchyLoss = −log( Σ fine-class probability mass inside the TRUE superclass )
-                  = NLL of the true parent under the fine distribution marginalized up the tree
+D      = 1 if argmax(fine) is not a child of argmax(coarse) else 0
+l_prev = 0 if argmax(coarse) == coarse_true else 1
+l_curr = 0 if argmax(fine)   == fine_true   else 1
+dloss  = Σ p^(D·l_prev) · p^(D·l_curr) − 1          # p = 3
 ```
 
-The fix is to stop asking *"which class won?"* (a step function — flat almost everywhere, so zero gradient)
-and start asking *"how much probability landed in the right block?"* (smooth in every logit).
+Every term is piecewise-constant in the logits. A small change to a logit doesn't move the argmax, so the
+derivative is zero almost everywhere. Autograd doesn't even build a graph for it. The term can log a value of
+~790 and still contribute **zero gradient**. It works as a monitoring number, not as a loss.
 
-The linear algebra: let `M` be the `(20 × 100)` membership matrix with `M[c,f] = 1` iff `f` is a child of `c`.
-Every column holds exactly one 1, so `M` is the one-hot encoding of parenthood — and `probs @ Mᵀ` is precisely
-the vector of parent marginals. **Marginalizing up a tree is a matrix product**; the taxonomy stops being
-control flow and becomes a linear operator, which is why it's differentiable at all.
+**The way out is to measure mass, not the winner.** Let `M` be the `20 × 100` membership matrix, with
+`M[c, f] = 1` iff `f` is a child of `c`. Then `probs @ Mᵀ` is the vector of parent marginals. Marginalizing up
+a tree is a matrix product, and a matrix product is smooth in every logit. Both replacement losses build on this.
+They are computed in log space (`log_softmax` → `masked_fill(-inf)` → `logsumexp`), so they stay exact when a
+parent's mass underflows float32. A test pins that case.
 
-In code it's evaluated in log-space (`log_softmax` → `masked_fill(-inf)` → `logsumexp`) rather than literally
-forming `probs @ Mᵀ`. Same quantity, but exact in the tail: once the mass in a parent drops below ~1e-45 it
-flushes to 0 in float32 and the naive form returns `log(0) = -inf`, usually patched with an `eps` that silently
-caps the loss and biases the gradient. There's a test pinning this exact case.
+## How the fix was found
 
-See `losses.SoftHierarchyLoss` and the reusable `structured_loss.SoftHierarchyLoss`.
+1. **Predicted** that `dloss` carries no gradient, then **confirmed** it two ways. It raises on `.backward()`, and
+   runs with and without it from the same seed are identical at every epoch.
+2. **Tried `SoftHierarchyLoss` = −log(fine mass inside the *true* parent).** It is differentiable and reaches the
+   backbone, but the violation rate got slightly *worse*.
+3. **Diagnosed why.** The loss compares the fine head with the **label**. The metric compares the fine head with
+   the **coarse head**, and the label never appears in it. The loss is also implied by the fine cross-entropy
+   that `lloss` already contains: `p(fine_true) ≤ mass(parent_true)`. So it added almost nothing new.
+4. **Wrote `HeadAgreementLoss` = KL(m ‖ c).** Here `m` is the fine distribution marginalized to the parents, and
+   `c` is the coarse head's distribution. With the measured quantity in the objective, the violation rate fell.
 
-## Results — measured, not claimed
+**Lesson:** a regularizer can be differentiable, correct, and well-motivated and still do nothing for your
+metric if it doesn't optimize what you measure. You need a controlled A/B and a metric separate from accuracy
+to see that.
 
-Every number below is from an actual run on this code (Apple M-series MPS, seed 0, identical
-initialization and data order across variants). Reproduce with the commands in *Run it*.
+## Results
 
-**Stage 4 — 4 losses, 6 epochs, same seed.** `violation %` = how often the fine prediction's parent
-disagrees with the coarse head's prediction.
+All numbers come from real runs: Apple M-series MPS, seed 0, and identical initialization and data order
+across variants.
+
+**Stage 4: four objectives, 6 epochs.** Violation % is how often the fine prediction's parent disagrees with
+the coarse head.
 
 | objective | fine acc | violation % |
 |---|---|---|
-| `lloss` only (baseline) | 43.25% | 26.39% |
-| `lloss` + **their dloss** | **43.25%** | **26.39%** ← *identical to baseline, to the last decimal* |
-| `lloss` + soft loss (fine → TRUE parent) | 40.95% | 28.07% ← *did not help* |
-| `lloss` + **head-agreement KL(m‖c)** | 42.88% | **20.52%** ← *the fix* |
+| `lloss` only | 43.25% | 26.39% |
+| `lloss` + upstream `dloss` | 43.25% | 26.39% (identical, as predicted) |
+| `lloss` + `SoftHierarchyLoss` | 40.95% | 28.07% |
+| `lloss` + `HeadAgreementLoss` | 42.88% | **20.52%** |
 
-**Stages 1–3 — 8 epochs.**
+**Stages 1–3: 8 epochs.**
 
 | stage | fine acc | coarse acc | violation % |
 |---|---|---|---|
-| 1 · flat baseline | 49.46% | 63.31% | 36.69% \* |
-| 2 · two heads + layer loss | 50.79% | 62.86% | 23.08% |
+| 1 · flat baseline | 49.46% | 63.31% | 36.69%\* |
+| 2 · two heads + `lloss` | 50.79% | 62.86% | 23.08% |
 | 3 · coarse-to-fine conditioning | 48.16% | 60.42% | 24.17% |
 
-\* Stage 1 has one head, so there is no second opinion to contradict; its "violation" is measured against
-the *true* parent and is just `100 − coarse acc`. **It is not comparable to stages 2–3**, which measure
-disagreement *between the two heads*. Different question, different number.
+\* Stage 1 has one head, so it has nothing to disagree with. Its violation rate is measured against the *true*
+superclass (= 100 − coarse acc) and is **not comparable** with stages 2–3.
 
-Two honest negatives worth stating plainly: **Stage 3's conditioning did not beat Stage 2** here
-(-2.6 pts fine accuracy, slightly worse violation) — the upstream README's headline gain does not
-reproduce at this scale, though this is a small CNN at 8 epochs, not their ResNet50 at 100. And my
-first attempt at fixing the dependency loss failed, which turned out to be the most useful thing that happened:
-
-## The journey — how the fix was actually found
-
-1. **Read the upstream `dloss` and noticed it's built from `argmax`/`==`/`where`.** Predicted it carries no
-   gradient. *Evidence:* `requires_grad=False`, `grad_fn=None`, and it raises on `.backward()`.
-2. **Proved it behaviorally, not just theoretically.** Trained baseline vs baseline+dloss from the same seed.
-   The trajectories are **bit-for-bit identical at every epoch** — while the term itself reports a value of
-   ~790. A loss can be large, look active in your logs, and be doing *nothing*.
-3. **Wrote `SoftHierarchyLoss`** (mass in the true parent, via marginalization). Differentiable, gradient
-   reaches the backbone, mathematically sound — and it **failed to improve the violation rate** (28.07% vs
-   26.39% baseline).
-4. **Diagnosed why, and this is the real lesson.** The loss ties the fine head to the **true** parent label.
-   The metric compares the fine head against the **coarse head's prediction**. The truth never appears in the
-   metric. So the loss can be fully satisfied while the two heads still contradict each other — *I had
-   optimized a different consistency than the one I was measuring.*
-5. **Wrote `HeadAgreementLoss` = KL(m ‖ c)** — marginalize the fine distribution to the parents and make it
-   agree with the coarse head's own distribution. Now the measured quantity is *in* the objective.
-   **Violation 26.39% → 20.52%** at no meaningful accuracy cost.
-
-The transferable lesson is not "use KL." It's that **a regularizer can be differentiable, correct, and
-well-motivated and still do nothing for your metric, because it doesn't optimize the thing you're measuring.**
-Being able to see that required a controlled A/B and a metric separate from accuracy. Step 3 was not wasted
-work — it was the experiment that located the real problem.
-
-## Other things I changed (and why)
-
-- **MPS.** Repo is `cuda`-or-`cpu` only; on a Mac it silently runs on CPU. `device.pick_device` is MPS-first.
-- **Data pipeline.** Repo dumps ~60k PNGs + a CSV then re-reads with `cv2` (and has a dead `cv2.resize`).
-  Replaced by `torchvision.datasets.CIFAR100` + the canonical fine→coarse map (`hierarchy.py`, ~1 file).
-- **Visualization.** Repo = three seaborn line charts. Here: taxonomy tree, block-structured confusion matrix
-  (errors inside vs. across superclass blocks), violation-rate comparison, and a PCA embedding-evolution GIF.
-- **Controlled comparisons** instead of the repo's "+10%, but maybe it's the augmentation" hedge.
+Stage 3 did not reproduce the upstream gain. This run used a small CNN for 8 epochs, not ResNet50 for 100, so
+treat the result as "no gain at this scale" rather than a verdict.
 
 ## The pathway
 
-| stage | script | idea | artifact |
-|------|--------|------|----------|
-| 0 | `s0_tree.py` | see the taxonomy | `runs/hierarchy_tree.png` |
-| 1 | `s1_flat_baseline.py` | flat 100-way; measure implied violations | `runs/s1_confusion.png` |
-| 2 | `s2_two_head_lloss.py` | coarse+fine heads, layer loss | `runs/s2_*` |
-| 3 | `s3_coarse_to_fine.py` | concat coarse logits into fine head | `runs/s3_*` |
-| 4 | `s4_dependency_loss.py` | prove dloss is dead → find the loss that actually works | `runs/violation_comparison.png` |
-| 5 | `s5_representation_evolution.py` | watch superclasses cluster | `runs/embedding_evolution.gif` |
-| 6 | `structured_loss.py` | reusable, dataset-agnostic toolkit | — |
+| stage | script | idea | output in `runs/` |
+|---|---|---|---|
+| 0 | `s0_tree.py` | see the taxonomy | `hierarchy_tree.png` |
+| 1 | `s1_flat_baseline.py` | flat 100-way classifier and the violations it implies | `s1_confusion.png`, `s1_curves.png` |
+| 2 | `s2_two_head_lloss.py` | coarse + fine heads, layer loss | `s2_confusion.png`, `s2_curves.png` |
+| 3 | `s3_coarse_to_fine.py` | feed coarse logits into the fine head | `s3_confusion.png`, `s3_curves.png` |
+| 4 | `s4_dependency_loss.py` | prove `dloss` is dead, then find a loss that works | `violation_comparison.png` |
+| 5 | `s5_representation_evolution.py` | watch features cluster by superclass | `embedding_evolution.gif`, `embedding_trajectory.png` |
+| — | `structured_loss.py` | reusable, dataset-agnostic losses | — |
 
 ## Run it
 
 ```bash
 uv sync
-uv run python s0_tree.py                       # instant, no download
+uv run python s0_tree.py                        # instant, no download
 uv run python s1_flat_baseline.py --epochs 8
-uv run python s4_dependency_loss.py --epochs 6 # the money shot
+uv run python s4_dependency_loss.py --epochs 6  # the main experiment
 uv run python s5_representation_evolution.py --epochs 12
+uv run pytest
 ```
 
-All scripts: `--epochs --lr --batch-size --seed --device`. Artifacts land in `runs/` (gitignored).
+The training scripts accept `--epochs --lr --batch-size --seed --device`.
 
-> **Note on the dataset:** on macOS, torchvision's downloader can hit `CERTIFICATE_VERIFY_FAILED`. If so,
-> pre-fetch once with the system trust store:
-> `curl -fsSL -o data/cifar-100-python.tar.gz https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz`
-> then run normally (torchvision extracts the local tarball).
+**On macOS**, torchvision's downloader may fail with `CERTIFICATE_VERIFY_FAILED`. If it does, fetch the archive
+once with curl and re-run:
+
+```bash
+mkdir -p data
+curl -C - -fSL -o data/cifar-100-python.tar.gz https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz
+```
+
+## Changes from upstream
+
+- **Device:** MPS first, then CUDA, then CPU (`device.pick_device`). Upstream silently falls back to CPU on a Mac.
+- **Data:** `torchvision.datasets.CIFAR100` plus a hard-coded fine→coarse map (`hierarchy.py`). This replaces
+  the upstream PNG dump, CSV, and cv2 re-read.
+- **Visuals:** a taxonomy tree, a confusion matrix grouped into superclass blocks, violation curves, and a GIF
+  of the PCA embedding over training. Upstream has three line charts.
+- **Comparisons:** every variant shares a seed and data order, so each difference comes from one change.
 
 ## Where this transfers
 
-Any task with known output structure: LLM classification/routing over a label taxonomy, cascaded coarse-to-fine
-decoders, product/document categorization, ICD/ontology codes. The reusable pattern lives in `structured_loss.py`
-— point it at any `child_to_parent` map. The meta-lesson: **enforce structure by marginalizing probabilities,
-never by argmax** — argmax has no gradient.
+Any model whose outputs have known structure can use this: label taxonomies in LLM routing or classification,
+coarse-to-fine decoders, product categorization, ICD codes and other ontologies. Point
+`structured_loss.SoftHierarchyLoss` / `HeadAgreementLoss` at any `child_to_parent` list.
+
+**Enforce structure by marginalizing probabilities, never by argmax.**

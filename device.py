@@ -26,11 +26,3 @@ def set_seed(seed: int = 0) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-
-def randperm(n: int, device: torch.device) -> torch.Tensor:
-    """MPS has no native randperm kernel: build on CPU, then move.
-
-    (Learned from prototypical-toy — same class of MPS gap as cdist's missing
-    backward.)
-    """
-    return torch.randperm(n).to(device)

@@ -135,6 +135,14 @@ class CoarseToFineModel(nn.Module):
     cannot *forbid* an inconsistent answer, which is why the architecture alone
     does not drive the violation rate to zero and the loss still has work to do.
 
+    It also adds no expressive power. level_1 is a linear function of z (two
+    Linear layers with no nonlinearity between them), so A @ level_1 is too, and
+    the fine logits are still one affine function of z -- exactly the function
+    class of TwoHeadModel's fine head. What changes is only the parameterization:
+    the coarse loss now shapes weights the fine head also uses. That is a
+    plausible reason Stage 3 does not beat Stage 2 in our runs. (Feeding in
+    softmax(level_1) instead would make the coupling genuinely nonlinear.)
+
     We return raw logits and let the loss apply softmax -- matching their
     pre-softmax concatenation, and keeping the numerically stable fused
     log-softmax inside cross_entropy rather than doing softmax twice.

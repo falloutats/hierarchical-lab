@@ -2,7 +2,9 @@
 
 Train the coarse-to-fine model with layer loss + the differentiable soft
 hierarchy loss, and after every epoch snapshot the penultimate features of a
-fixed test subset. Render a 2-D PCA GIF colored by superclass plus a centroid-
+fixed test subset. The soft loss (not the head-agreement loss from Stage 4) is
+the right choice here: we want to watch features group by their TRUE superclass,
+and that is exactly what it rewards. Render a 2-D PCA GIF colored by superclass plus a centroid-
 trajectory PNG — the prototypical-toy "watch it evolve" experience, on a real
 20-way taxonomy.
 
@@ -14,6 +16,7 @@ Writes runs/embedding_evolution.gif and runs/embedding_trajectory.png
 from __future__ import annotations
 
 import argparse
+import itertools
 
 import torch
 from tqdm import tqdm
@@ -49,8 +52,10 @@ def main() -> None:
     print(f"device: {device}")
 
     train_loader, test_loader = make_loaders(batch_size=args.batch_size)
-    # Fixed subset of the test set for consistent snapshots across epochs.
-    subset = list(test_loader)[:8]
+    # Fixed subset of the test set for consistent snapshots across epochs. The
+    # test loader is unshuffled, so these are the same 2048 images every time;
+    # islice stops after 8 batches instead of loading the whole test set.
+    subset = list(itertools.islice(test_loader, 8))
 
     model = CoarseToFineModel().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -75,6 +80,7 @@ def main() -> None:
         eco.record(epoch, feats, coarse_np)
 
         # cheap per-epoch scalar readout
+        model.eval()
         cl, fl, ct, ft = [], [], [], []
         with torch.no_grad():
             for x, c, f in test_loader:
